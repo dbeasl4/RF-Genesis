@@ -1,0 +1,57 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Real perspective camera, matching the CUDA kernel's camera ray math.
+// Camera basis vectors and FOV come in via push constants, computed on
+// the CPU side per dispatch (main.cpp), same as the CUDA wrapper does.
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0) buffer OutputBuffer { vec2 data[]; } outputBuffer; // x=distance, y=intensity
+
+layout(push_constant) uniform PushConstants {
+    vec4 camOrigin;
+    vec4 camRight;
+    vec4 camUp;
+    vec4 camForward;
+    vec4 lightPosIntensity;   // xyz = light position, w = light intensity
+    vec4 params;              // x = tanHalfFov, y = aspect
+    uint64_t vertexBufferAddress;
+    uint64_t indexBufferAddress;
+} pc;
+
+struct RayPayload { float distance; float intensity; };
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+void main() {
+    uint idx = gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x;
+
+    vec2 uv = (vec2(gl_LaunchIDEXT.xy) + 0.5) / vec2(gl_LaunchSizeEXT.xy);
+    vec2 ndc = uv * 2.0 - 1.0;
+
+    float tanHalfFov = pc.params.x;
+    float aspect = pc.params.y;
+
+    vec3 dir = normalize(
+        pc.camRight.xyz   * (ndc.x * tanHalfFov * aspect) +
+        pc.camUp.xyz      * (ndc.y * tanHalfFov) +
+        pc.camForward.xyz
+    );
+
+    payload.distance = -1.0;
+    payload.intensity = 0.0;
+
+    traceRayEXT(
+        topLevelAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,
+        0, 0, 0,
+        pc.camOrigin.xyz,
+        0.001,
+        dir,
+        1000.0,
+        0
+    );
+
+    outputBuffer.data[idx] = vec2(payload.distance, payload.intensity);
+}

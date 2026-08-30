@@ -167,3 +167,19 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+
+# Custom ray tracer build artifacts
+genesis/raytracing/vulkan_raytracer/build/
+genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/build/
+genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/*.egg-info/
+genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/vulkan_headers/
+genesis/raytracing/RayTracerCustom/build/
+genesis/raytracing/RayTracerCustom/*.egg-info/
+**/*.so
+**/__pycache__/
+
+# Leftover setup.sh downloads
+*.zip
+
+# Generated output
+output/

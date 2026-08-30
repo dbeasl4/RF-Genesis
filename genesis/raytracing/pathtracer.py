@@ -5,6 +5,10 @@ import numpy as np
 from . import smpl
 import torch
 from tqdm import tqdm
+import os
+USE_CUSTOM_RAYTRACER = os.environ.get("RFGEN_CUSTOM_RT", "0") == "1"
+USE_VULKAN_RAYTRACER = os.environ.get("RFGEN_VULKAN_RT", "0") == "1"
+
 mi.set_variant('cuda_ad_rgb')
 torch.set_default_device('cuda')
 
@@ -76,14 +80,17 @@ class RayTracer:
         t[t>9999]=0
         distance = np.array(t).reshape(self.PIR_resolution,self.PIR_resolution)
         intensity = np.array(intensity)[:,:,0]
-        velocity = np.zeros((self.PIR_resolution,self.PIR_resolution))  # the velocity is zero for this static frame, 
-                                                                        # but will be calculated later by calculating the difference between two frames
-        
+        velocity = np.zeros((self.PIR_resolution,self.PIR_resolution)) # the velocity is zero for this static frame,
         PIR = np.stack([distance,intensity,velocity],axis=2)
-        pointclouds = np.array(si.p)        # We save the points here for faster calculation, it can be calculated from the PIR's distance + sensor's intrinsic metrix
+        pointclouds = np.array(si.p) 
         return PIR, pointclouds
-    
 
+
+# This is used to compare our CUDA implementatin and Vulkan
+if USE_CUSTOM_RAYTRACER:
+    from .RayTracerCustom.raytracer import RayTracer
+if USE_VULKAN_RAYTRACER:
+    from .vulkan_raytracer.VulkanCudaInterop.live_raytracer import RayTracer
 
 def get_deafult_scene(res = 512):
     integrator = mi.load_dict({

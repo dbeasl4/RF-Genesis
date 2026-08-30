@@ -152,8 +152,10 @@ def draw_combined(i,pointcloud_cfg,radar_frames,pointclouds,smpl_data):
 
     plt.tight_layout()
     fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    data = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+    data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    data = data[:, :, [1, 2, 3, 0]]  # ARGB -> RGBA reorder
+    data = data[:, :, :3]  # drop alpha, keep RGB
     plt.close(fig) 
     return data
 
