@@ -183,3 +183,4 @@ genesis/raytracing/RayTracerCustom/*.egg-info/
 
 # Generated output
 output/
+genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/*.png
