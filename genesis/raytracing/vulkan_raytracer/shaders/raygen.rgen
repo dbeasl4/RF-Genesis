@@ -27,7 +27,11 @@ void main() {
     uint idx = gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x;
 
     vec2 uv = (vec2(gl_LaunchIDEXT.xy) + 0.5) / vec2(gl_LaunchSizeEXT.xy);
-    vec2 ndc = uv * 2.0 - 1.0;
+    // Flip y: image row 0 is the top of the image, which should map to
+    // +y in camera space. Matches raytracer_kernel.cu's ndc_y and Mitsuba's
+    // convention; without this the Vulkan output is vertically mirrored
+    // relative to the other two backends.
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
     float tanHalfFov = pc.params.x;
     float aspect = pc.params.y;

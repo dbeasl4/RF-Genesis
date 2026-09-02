@@ -6,16 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Vulkan REQUIRED)
 
-# Shader compilation (GLSL -> SPIR-V)
-# Uses glslangValidator (confirmed available from the earlier
-# `sudo apt install glslang-tools` step) rather than glslc, which wasn't
-# found on this system.
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 
 set(SHADER_SOURCES
     ${CMAKE_SOURCE_DIR}/shaders/raygen.rgen
     ${CMAKE_SOURCE_DIR}/shaders/closesthit.rchit
     ${CMAKE_SOURCE_DIR}/shaders/miss.rmiss
+    ${CMAKE_SOURCE_DIR}/shaders/shadow.rmiss
 )
 
 set(SPIRV_BINARY_FILES "")
@@ -34,15 +31,6 @@ endforeach()
 
 add_custom_target(shaders ALL DEPENDS ${SPIRV_BINARY_FILES})
 
-# Main executable
 add_executable(vulkan_raytracer src/main.cpp)
 target_link_libraries(vulkan_raytracer PRIVATE Vulkan::Vulkan)
 add_dependencies(vulkan_raytracer shaders)
-
-# Build:
-#   mkdir build && cd build
-#   cmake ..
-#   cmake --build .
-#
-# Run (from inside build/, so the relative "shaders/*.spv" paths resolve):
-#   ./vulkan_raytracer

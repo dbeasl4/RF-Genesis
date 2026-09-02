@@ -24,7 +24,12 @@ import custom_raytracer_cuda
 class RayTracer:
 
     def __init__(self, resolution=128, fov=60.0,
-                 light_pos=(0.0, 0.0, 3.0), light_intensity=1000.0):
+                 light_pos=(0.0, 0.0, 3.0), light_intensity=1000.0,
+                 # Matches pathtracer.py's get_deafult_scene(): a spot
+                 # emitter aimed at the world origin with cutoff_angle=40
+                 # (Mitsuba defaults beam_width to cutoff_angle * 3/4 when
+                 # unspecified, i.e. 30 degrees here).
+                 light_target=(0.0, 0.0, 0.0), cutoff_angle=40.0, beam_width=None):
         self.PIR_resolution = resolution
         self.fov = fov
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -39,6 +44,9 @@ class RayTracer:
 
         self.light_pos = torch.tensor(light_pos, dtype=torch.float32, device=self.device)
         self.light_intensity = float(light_intensity)
+        self.light_target = torch.tensor(light_target, dtype=torch.float32, device=self.device)
+        self.cutoff_angle = float(cutoff_angle)
+        self.beam_width = float(beam_width) if beam_width is not None else cutoff_angle * 0.75
 
     def update_pose(self, pose_params, shape_params, translation=None):
         """Matches pathtracer.RayTracer.update_pose's real signature."""
@@ -77,7 +85,8 @@ class RayTracer:
             self.cam_origin, right, up, forward,
             self.fov,
             self.PIR_resolution, self.PIR_resolution,
-            self.light_pos, self.light_intensity
+            self.light_pos, self.light_intensity,
+            self.light_target, self.cutoff_angle, self.beam_width
         )
 
         distance_np = distance.cpu().numpy()

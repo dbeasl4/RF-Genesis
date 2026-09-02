@@ -332,7 +332,7 @@ public:
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
         bindings[1].binding = 1;
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[1].descriptorCount = 1;
@@ -360,8 +360,9 @@ public:
         VkShaderModule raygenMod = loadShaderModule(device_, shaderDir_ + "/raygen.rgen.spv");
         VkShaderModule chitMod = loadShaderModule(device_, shaderDir_ + "/closesthit.rchit.spv");
         VkShaderModule missMod = loadShaderModule(device_, shaderDir_ + "/miss.rmiss.spv");
+        VkShaderModule shadowMissMod = loadShaderModule(device_, shaderDir_ + "/shadow.rmiss.spv");
 
-        std::array<VkPipelineShaderStageCreateInfo, 3> stages{};
+        std::array<VkPipelineShaderStageCreateInfo, 4> stages{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
         stages[0].module = raygenMod; stages[0].pName = "main";
@@ -371,8 +372,11 @@ public:
         stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
         stages[2].module = chitMod; stages[2].pName = "main";
+        stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[3].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+        stages[3].module = shadowMissMod; stages[3].pName = "main";
 
-        std::array<VkRayTracingShaderGroupCreateInfoKHR, 3> groups{};
+        std::array<VkRayTracingShaderGroupCreateInfoKHR, 4> groups{};
         groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
         groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
         groups[0].generalShader = 0; groups[0].closestHitShader = VK_SHADER_UNUSED_KHR;
@@ -385,12 +389,18 @@ public:
         groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
         groups[2].generalShader = VK_SHADER_UNUSED_KHR; groups[2].closestHitShader = 2;
         groups[2].anyHitShader = VK_SHADER_UNUSED_KHR; groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
+        groups[3].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        groups[3].generalShader = 3; groups[3].closestHitShader = VK_SHADER_UNUSED_KHR;
+        groups[3].anyHitShader = VK_SHADER_UNUSED_KHR; groups[3].intersectionShader = VK_SHADER_UNUSED_KHR;
 
         VkRayTracingPipelineCreateInfoKHR rpci{};
         rpci.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-        rpci.stageCount = 3; rpci.pStages = stages.data();
-        rpci.groupCount = 3; rpci.pGroups = groups.data();
-        rpci.maxPipelineRayRecursionDepth = 1;
+        rpci.stageCount = 4; rpci.pStages = stages.data();
+        rpci.groupCount = 4; rpci.pGroups = groups.data();
+        // Primary ray (depth 1) + the shadow ray closesthit.rchit traces
+        // for occlusion (depth 2).
+        rpci.maxPipelineRayRecursionDepth = 2;
         rpci.layout = pipelineLayout_;
         if (pfn_vkCreateRayTracingPipelinesKHR(device_, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &rpci, nullptr, &pipeline_) != VK_SUCCESS)
             throw std::runtime_error("Failed to create ray tracing pipeline.");
@@ -398,18 +408,24 @@ public:
         vkDestroyShaderModule(device_, raygenMod, nullptr);
         vkDestroyShaderModule(device_, chitMod, nullptr);
         vkDestroyShaderModule(device_, missMod, nullptr);
+        vkDestroyShaderModule(device_, shadowMissMod, nullptr);
 
         // shader binding table
+        // handles[] order matches groups[] order: 0=raygen, 1=primary miss,
+        // 2=hit group, 3=shadow miss.
         uint32_t handleSize = rtProps.shaderGroupHandleSize;
         uint32_t handleAligned = (uint32_t)alignUp(handleSize, rtProps.shaderGroupHandleAlignment);
         uint32_t baseAlign = rtProps.shaderGroupBaseAlignment;
-        std::vector<uint8_t> handles(3 * handleSize);
-        pfn_vkGetRayTracingShaderGroupHandlesKHR(device_, pipeline_, 0, 3, handles.size(), handles.data());
+        std::vector<uint8_t> handles(4 * handleSize);
+        pfn_vkGetRayTracingShaderGroupHandlesKHR(device_, pipeline_, 0, 4, handles.size(), handles.data());
 
         raygenRegion_.stride = alignUp(handleAligned, baseAlign);
         raygenRegion_.size = raygenRegion_.stride;
         missRegion_.stride = handleAligned;
-        missRegion_.size = alignUp(handleAligned, baseAlign);
+        // Two miss shaders now: primary (missIndex 0, raygen.rgen's trace)
+        // and shadow (missIndex 1, closesthit.rchit's trace) -- their
+        // order here must match those missIndex values exactly.
+        missRegion_.size = alignUp(2 * handleAligned, baseAlign);
         hitRegion_.stride = handleAligned;
         hitRegion_.size = alignUp(handleAligned, baseAlign);
         VkDeviceSize sbtSize = raygenRegion_.size + missRegion_.size + hitRegion_.size;
@@ -419,9 +435,13 @@ public:
                      sbtBuffer_, sbtMemory_);
         uint8_t* sbtMap;
         vkMapMemory(device_, sbtMemory_, 0, sbtSize, 0, (void**)&sbtMap);
-        memcpy(sbtMap, handles.data(), handleSize);
-        memcpy(sbtMap + raygenRegion_.size, handles.data() + handleSize, handleSize);
-        memcpy(sbtMap + raygenRegion_.size + missRegion_.size, handles.data() + 2 * handleSize, handleSize);
+        memcpy(sbtMap, handles.data() + 0 * handleSize, handleSize);  // raygen
+        memcpy(sbtMap + raygenRegion_.size + 0 * missRegion_.stride,
+               handles.data() + 1 * handleSize, handleSize);          // primary miss (missIndex 0)
+        memcpy(sbtMap + raygenRegion_.size + 1 * missRegion_.stride,
+               handles.data() + 3 * handleSize, handleSize);          // shadow miss (missIndex 1)
+        memcpy(sbtMap + raygenRegion_.size + missRegion_.size,
+               handles.data() + 2 * handleSize, handleSize);          // hit group
         vkUnmapMemory(device_, sbtMemory_);
 
         VkDeviceAddress sbtAddr = getBufferDeviceAddress(device_, sbtBuffer_);
@@ -565,6 +585,12 @@ public:
         pc.lightPosIntensity[3] = lightIntensity_;
         float tanHalfFov = tanf(fov_ * 0.5f * 3.14159265358979f / 180.0f);
         pc.params[0] = tanHalfFov; pc.params[1] = 1.0f;
+        // Spot light cone (see closesthit.rchit): radians, no room left in
+        // this push-constant block for a separate forward vector, so the
+        // shader derives the axis from lightPos assuming a world-origin
+        // target, matching this scene's fixed setup.
+        pc.params[2] = cutoffAngleDeg_ * 3.14159265358979f / 180.0f;
+        pc.params[3] = beamWidthDeg_ * 3.14159265358979f / 180.0f;
         pc.vertexBufferAddress = getBufferDeviceAddress(device_, vertexBuffer_);
         pc.indexBufferAddress = getBufferDeviceAddress(device_, indexBuffer_);
 
@@ -584,6 +610,13 @@ public:
 
         torch::Tensor distance = raw.select(2, 0);
         torch::Tensor intensity = raw.select(2, 1);
+        // miss.rmiss writes -1 for a miss; remap to 0 to match Mitsuba's
+        // t>9999->0 and the CUDA kernel's convention. Without this, missed
+        // rays produce hit_pos = origin - dir (a point behind the camera)
+        // instead of being excluded like the other two backends.
+        torch::Tensor missMask = distance < 0;
+        distance = torch::where(missMask, torch::zeros_like(distance), distance);
+        intensity = torch::where(missMask, torch::zeros_like(intensity), intensity);
         torch::Tensor velocity = torch::zeros_like(distance);
         torch::Tensor PIR = torch::stack({distance, intensity, velocity}, 2);
 
@@ -618,7 +651,8 @@ private:
     };
 
     void rebuildAccelerationStructures() {
-        /
+        // Destroy last frame's BLAS/TLAS before building this frame's, since
+        // the mesh deforms every call and we don't reuse acceleration structures.
         if (blas_.handle) { pfn_vkDestroyAccelerationStructureKHR(device_, blas_.handle, nullptr); vkDestroyBuffer(device_, blas_.buffer, nullptr); vkFreeMemory(device_, blas_.memory, nullptr); blas_ = {}; }
         if (tlas_.handle) { pfn_vkDestroyAccelerationStructureKHR(device_, tlas_.handle, nullptr); vkDestroyBuffer(device_, tlas_.buffer, nullptr); vkFreeMemory(device_, tlas_.memory, nullptr); tlas_ = {}; }
 
@@ -788,6 +822,11 @@ private:
 
     Vec3 camOrigin_, camTarget_, lightPos_;
     float lightIntensity_;
+    // Mitsuba's 'tx' emitter is a spot light with cutoff_angle=40 and an
+    // implicit beam_width of cutoff_angle*3/4=30 (get_deafult_scene()
+    // doesn't set beam_width explicitly, so Mitsuba's own default applies).
+    float cutoffAngleDeg_ = 40.0f;
+    float beamWidthDeg_ = 30.0f;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

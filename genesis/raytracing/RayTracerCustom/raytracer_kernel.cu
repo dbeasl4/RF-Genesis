@@ -72,6 +72,9 @@ __global__ void raytrace_kernel(
     int width, int height,
     float3 light_pos,
     float light_intensity,
+    float3 light_forward,  // normalized spot axis, light_pos -> light_target
+    float cutoff_rad,      // Mitsuba 'cutoff_angle': falloff reaches 0 here
+    float beam_rad,        // Mitsuba 'beam_width': full intensity within this angle
     float* __restrict__ out_distance,
     float* __restrict__ out_intensity)
 {
@@ -127,8 +130,69 @@ __global__ void raytrace_kernel(
         float ndotl = fmaxf(dot3(closest_normal, light_dir), 0.0f);
         float falloff = light_intensity / fmaxf(dist_to_light * dist_to_light, 1e-4f);
 
+        // Shadow ray: Mitsuba's 'direct' integrator traces a real
+        // visibility/shadow ray as part of sampling direct illumination,
+        // so points on the body occluded by other parts of the body (the
+        // underside of an arm, the back of a leg, etc.) come out dark.
+        // Without this, every front-facing point gets full unoccluded
+        // light regardless of what's between it and the light -- verified
+        // against Mitsuba: mean intensity over hit pixels came out
+        // 60-130% too high with this omitted, while max (rarely
+        // self-shadowed) stayed close.
+        //
+        // Brute-force like the primary ray: fine for ~14k triangles;
+        // revisit with a BVH/any-hit-only query if this doubles cost too
+        // much at higher resolution.
+        float3 shadow_origin = add3(hit_pos, scale3(closest_normal, 1e-3f));
+        bool occluded = false;
+        for (int f2 = 0; f2 < num_faces; f2++) {
+            int j0 = faces[f2 * 3 + 0];
+            int j1 = faces[f2 * 3 + 1];
+            int j2 = faces[f2 * 3 + 2];
+            float3 w0 = f3(vertices[j0 * 3 + 0], vertices[j0 * 3 + 1], vertices[j0 * 3 + 2]);
+            float3 w1 = f3(vertices[j1 * 3 + 0], vertices[j1 * 3 + 1], vertices[j1 * 3 + 2]);
+            float3 w2 = f3(vertices[j2 * 3 + 0], vertices[j2 * 3 + 1], vertices[j2 * 3 + 2]);
+            float t2;
+            float3 n2;
+            // Only care whether *anything* blocks the light, and only
+            // strictly between the surface and the light itself.
+            if (ray_triangle_intersect(shadow_origin, light_dir, w0, w1, w2, t2, n2) &&
+                t2 < dist_to_light - 1e-3f) {
+                occluded = true;
+                break;
+            }
+        }
+        float shadow = occluded ? 0.0f : 1.0f;
+
+        // Match Mitsuba's diffuse BSDF (albedo/pi * N.L * irradiance) and
+        // the Vulkan closest-hit shader's shading, which both include this
+        // factor. Without it this kernel is ~4x too bright relative to them.
+        const float albedo = 0.8f;
+        const float PI = 3.14159265359f;
+
+        // Mitsuba's 'tx' emitter is a spot light, not an isotropic point
+        // light: it has a cone with a linear angular falloff from
+        // beam_width (full intensity) out to cutoff_angle (zero), per
+        // https://mitsuba.readthedocs.io/en/latest/src/generated/plugins_emitters.html.
+        // Without this term this kernel over-brightens off-axis points,
+        // increasingly so as the body gets closer (verified against
+        // Mitsuba: the intensity gap grew from ~3% to ~16% across frames
+        // as distance dropped from ~6.7 to ~3.3).
+        float3 point_to_light = scale3(light_dir, -1.0f);  // light_pos -> hit_pos
+        float cos_theta = dot3(point_to_light, light_forward);
+        cos_theta = fminf(fmaxf(cos_theta, -1.0f), 1.0f);
+        float theta = acosf(cos_theta);
+        float spot_falloff;
+        if (theta >= cutoff_rad) {
+            spot_falloff = 0.0f;
+        } else if (theta <= beam_rad) {
+            spot_falloff = 1.0f;
+        } else {
+            spot_falloff = (cutoff_rad - theta) / fmaxf(cutoff_rad - beam_rad, 1e-6f);
+        }
+
         out_distance[idx] = closest_t;
-        out_intensity[idx] = ndotl * falloff;
+        out_intensity[idx] = (albedo / PI) * ndotl * falloff * spot_falloff * shadow;
     } else {
         out_distance[idx] = 0.0f;
         out_intensity[idx] = 0.0f;
@@ -154,7 +218,10 @@ std::vector<torch::Tensor> raytrace_cuda(
     int64_t width,
     int64_t height,
     torch::Tensor light_pos,
-    double light_intensity)
+    double light_intensity,
+    torch::Tensor light_target,   // float32 [3]; spot light aims here
+    double cutoff_angle_deg,
+    double beam_width_deg)
 {
     TORCH_CHECK(vertices.is_cuda(), "vertices must be a CUDA tensor");
     TORCH_CHECK(faces.is_cuda(), "faces must be a CUDA tensor");
@@ -175,14 +242,19 @@ std::vector<torch::Tensor> raytrace_cuda(
     auto cu = cam_up.cpu();
     auto cf = cam_forward.cpu();
     auto lp = light_pos.cpu();
+    auto lt = light_target.cpu();
 
     float3 cam_origin_f  = f3(co[0].item<float>(), co[1].item<float>(), co[2].item<float>());
     float3 cam_right_f   = f3(cr[0].item<float>(), cr[1].item<float>(), cr[2].item<float>());
     float3 cam_up_f      = f3(cu[0].item<float>(), cu[1].item<float>(), cu[2].item<float>());
     float3 cam_forward_f = f3(cf[0].item<float>(), cf[1].item<float>(), cf[2].item<float>());
     float3 light_pos_f   = f3(lp[0].item<float>(), lp[1].item<float>(), lp[2].item<float>());
+    float3 light_target_f = f3(lt[0].item<float>(), lt[1].item<float>(), lt[2].item<float>());
+    float3 light_forward_f = normalize3(sub3(light_target_f, light_pos_f));
 
     float tan_half_fov = tanf((float)(fov_degrees * M_PI / 180.0) * 0.5f);
+    float cutoff_rad = (float)(cutoff_angle_deg * M_PI / 180.0);
+    float beam_rad   = (float)(beam_width_deg * M_PI / 180.0);
 
     dim3 block(16, 16);
     dim3 grid((unsigned int)((width + block.x - 1) / block.x),
@@ -196,6 +268,7 @@ std::vector<torch::Tensor> raytrace_cuda(
         tan_half_fov,
         (int)width, (int)height,
         light_pos_f, (float)light_intensity,
+        light_forward_f, cutoff_rad, beam_rad,
         out_distance.data_ptr<float>(),
         out_intensity.data_ptr<float>()
     );
