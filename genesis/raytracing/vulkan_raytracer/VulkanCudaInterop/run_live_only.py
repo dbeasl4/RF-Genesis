@@ -2,7 +2,6 @@
 Runs only the live Vulkan ray tracer, without loading Mitsuba, for a
 lightweight standalone test that doesn't need the full comparison in
 validate_live.py. See GETTING_STARTED.md for how to run this.
-
 """
 import sys
 import os
@@ -56,12 +55,12 @@ PIR, pointclouds = live_tracer.trace()
 
 distance = PIR[:, :, 0]
 intensity = PIR[:, :, 1]
-hits = int((distance >= 0).sum())
+hits = int((distance > 0).sum())
 
 print(f"\nLive Vulkan render: {distance.shape[1]}x{distance.shape[0]}")
 print(f"Hits: {hits} / {distance.size}")
 if hits > 0:
-    print(f"Distance range:  [{distance[distance >= 0].min():.5f}, {distance[distance >= 0].max():.5f}]")
+    print(f"Distance range:  [{distance[distance > 0].min():.5f}, {distance[distance > 0].max():.5f}]")
     print(f"Intensity range: [{intensity.min():.5f}, {intensity.max():.5f}]")
 
 np.savez(raw_out, PIR=PIR, pointclouds=pointclouds)
@@ -69,7 +68,7 @@ np.savez(raw_out, PIR=PIR, pointclouds=pointclouds)
 
 def save_grayscale(arr, out_path, is_distance=False):
     a = arr.copy()
-    hit_mask = a >= 0
+    hit_mask = a > 0
     if is_distance and hit_mask.any():
         hit_min, hit_max = a[hit_mask].min(), a[hit_mask].max()
         span = max(hit_max - hit_min, 1e-6)

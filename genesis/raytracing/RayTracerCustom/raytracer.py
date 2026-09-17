@@ -17,11 +17,13 @@ comment for how to close these gaps):
 import torch
 import numpy as np
 
-from .. import smpl
-import custom_raytracer_cuda
+from .. import smpl  # RF-Genesis's existing genesis/raytracing/smpl.py
+import custom_raytracer_cuda  # built via `pip install -e .` in this folder
 
 
 class RayTracer:
+    """Named RayTracer (not CustomRayTracer) so it can be imported as a
+    literal drop-in for the Mitsuba version -- see integration notes below."""
 
     def __init__(self, resolution=128, fov=60.0,
                  light_pos=(0.0, 0.0, 3.0), light_intensity=1000.0,
@@ -94,11 +96,11 @@ class RayTracer:
         velocity_np = np.zeros_like(distance_np)
         PIR = np.stack([distance_np, intensity_np, velocity_np], axis=2)
 
-        # Reconstruct world-space hit position per pixel, equivalent to
-        # Mitsuba si.p, from distance and per-pixel ray direction, without
+        # Reconstruct world-space hit position per pixel (equivalent to
+        # Mitsuba's si.p) from distance + per-pixel ray direction, without
         # needing the kernel to output it separately: hit_pos = origin + dir * t
         res = self.PIR_resolution
-        aspect = 1.0 
+        aspect = 1.0  # square resolution
         tan_half_fov = torch.tan(torch.deg2rad(torch.tensor(self.fov / 2.0, device=self.device)))
         xs = (2.0 * (torch.arange(res, device=self.device).float() + 0.5) / res - 1.0) * tan_half_fov * aspect
         ys = (1.0 - 2.0 * (torch.arange(res, device=self.device).float() + 0.5) / res) * tan_half_fov
@@ -108,6 +110,6 @@ class RayTracer:
         dirs = torch.nn.functional.normalize(dirs, dim=-1)
 
         hit_pos = self.cam_origin + dirs * distance.unsqueeze(-1)
-        pointclouds = hit_pos.reshape(-1, 3).cpu().numpy()
+        pointclouds = hit_pos.reshape(-1, 3).cpu().numpy()  # flatten to (N,3), matching Mitsuba's si.p shape
 
         return PIR, pointclouds

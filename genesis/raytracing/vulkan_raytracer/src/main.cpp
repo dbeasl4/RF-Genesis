@@ -19,6 +19,30 @@
 #include <stdexcept>
 #include <array>
 #include <chrono>
+#include <dlfcn.h>
+#include "renderdoc_app.h"
+
+// Loaded only if this executable was launched through RenderDoc (its
+// capture library injects itself via LD_PRELOAD beforehand). Stays null,
+// and every call below is a no-op, when run normally outside RenderDoc.
+static RENDERDOC_API_1_6_0* rdoc_api = nullptr;
+
+static void loadRenderDocAPI() {
+    // RTLD_NOLOAD: only succeeds if RenderDoc's library is ALREADY loaded
+    // in this process (i.e. we were launched through RenderDoc). This is
+    // the safe pattern from RenderDoc's own docs -- it does nothing and
+    // fails harmlessly when run outside RenderDoc.
+    void* mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+    if (mod) {
+        pRENDERDOC_GetAPI RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
+        int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
+        if (ret == 1) {
+            std::cout << "RenderDoc detected -- capture API loaded.\n";
+        }
+    } else {
+        std::cout << "Running without RenderDoc (normal run, or launched outside it).\n";
+    }
+}
 
 const std::vector<const char*> requiredDeviceExtensions = {
     VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
@@ -35,7 +59,8 @@ struct AccelStruct {
 };
 
 struct MeshData {
-    std::vector<float> vertices; // x,y,z per vertex, flat
+    std::vector<float> vertices;   // x,y,z per vertex, flat
+    std::vector<float> normals;    // x,y,z per-vertex smooth normal, flat
     std::vector<uint32_t> indices; // 3 per triangle, flat
 };
 
@@ -47,9 +72,10 @@ struct PushConstants {
     float camUp[4];
     float camForward[4];
     float lightPosIntensity[4]; // xyz = position, w = intensity
-    float params[4]; // x = tanHalfFov, y = aspect
+    float params[4];            // x = tanHalfFov, y = aspect
     uint64_t vertexBufferAddress;
     uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
 };
 
 // tiny host-side vector helper (not used on the GPU)
@@ -233,7 +259,8 @@ VkShaderModule loadShaderModule(VkDevice device, const std::string& path) {
     return shaderModule;
 }
 
-// Loads the binary mesh file export_mesh.py writes
+// Loads the binary mesh file export_mesh.py writes. See that script's
+// docstring for the exact format.
 MeshData loadMeshFromFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
@@ -249,6 +276,9 @@ MeshData loadMeshFromFile(const std::string& path) {
     MeshData mesh;
     mesh.vertices.resize((size_t)vertexCount * 3);
     file.read(reinterpret_cast<char*>(mesh.vertices.data()), mesh.vertices.size() * sizeof(float));
+
+    mesh.normals.resize((size_t)vertexCount * 3);
+    file.read(reinterpret_cast<char*>(mesh.normals.data()), mesh.normals.size() * sizeof(float));
 
     mesh.indices.resize((size_t)faceCount * 3);
     file.read(reinterpret_cast<char*>(mesh.indices.data()), mesh.indices.size() * sizeof(uint32_t));
@@ -429,10 +459,12 @@ AccelStruct buildTLAS(VkPhysicalDevice physicalDevice, VkDevice device,
 // main
 
 int main() {
+    loadRenderDocAPI();
+
     const uint32_t WIDTH = 128;
     const uint32_t HEIGHT = 128;
 
-    // Instance an device setup
+    // Instance + device setup
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "RF-Genesis Custom Ray Tracer (Vulkan)";
@@ -534,17 +566,19 @@ int main() {
     VkCommandPool cmdPool;
     vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool);
 
-    // Load the real SMPL mesh
+    // Load the real SMPL mesh (exported by export_mesh.py, one directory
+    // up from build/, in vulkan_raytracer/)
     MeshData mesh = loadMeshFromFile("../smpl_mesh.bin");
     uint32_t vertexCount = (uint32_t)(mesh.vertices.size() / 3);
     uint32_t triangleCount = (uint32_t)(mesh.indices.size() / 3);
     std::cout << "Loaded mesh: " << vertexCount << " vertices, " << triangleCount << " triangles.\n\n";
 
     VkDeviceSize vertexBufferSize = mesh.vertices.size() * sizeof(float);
+    VkDeviceSize normalBufferSize = mesh.normals.size() * sizeof(float);
     VkDeviceSize indexBufferSize = mesh.indices.size() * sizeof(uint32_t);
 
-    VkBuffer vertexBuffer, indexBuffer;
-    VkDeviceMemory vertexMemory, indexMemory;
+    VkBuffer vertexBuffer, normalBuffer, indexBuffer;
+    VkDeviceMemory vertexMemory, normalMemory, indexMemory;
 
     createBuffer(physicalDevice, device, vertexBufferSize,
                  VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
@@ -553,6 +587,17 @@ int main() {
     void* vmap; vkMapMemory(device, vertexMemory, 0, vertexBufferSize, 0, &vmap);
     memcpy(vmap, mesh.vertices.data(), vertexBufferSize);
     vkUnmapMemory(device, vertexMemory);
+
+    // Normals aren't part of the BLAS build (only positions + indices are),
+    // just read directly by the shader via buffer_reference, same as
+    // vertices/indices already are -- STORAGE_BUFFER usage is enough.
+    createBuffer(physicalDevice, device, normalBufferSize,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 normalBuffer, normalMemory);
+    void* nmap; vkMapMemory(device, normalMemory, 0, normalBufferSize, 0, &nmap);
+    memcpy(nmap, mesh.normals.data(), normalBufferSize);
+    vkUnmapMemory(device, normalMemory);
 
     createBuffer(physicalDevice, device, indexBufferSize,
                  VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
@@ -577,7 +622,7 @@ int main() {
     double tlasMs = std::chrono::duration<double, std::milli>(tlasEnd - tlasStart).count();
     std::cout << "  TLAS built. (" << tlasMs << " ms)\n\n";
 
-    // Pipeline and shaders
+    // Pipeline + shaders
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
     rtProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
     VkPhysicalDeviceProperties2 props2{};
@@ -590,6 +635,7 @@ int main() {
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     bindings[0].descriptorCount = 1;
     bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+
     bindings[1].binding = 1;
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[1].descriptorCount = 1;
@@ -619,10 +665,13 @@ int main() {
     vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
 
     VkShaderModule raygenModule = loadShaderModule(device, "shaders/raygen.rgen.spv");
-    VkShaderModule closestHitModule = loadShaderModule(device, "shaders/closesthit.rchit.spv");
     VkShaderModule missModule = loadShaderModule(device, "shaders/miss.rmiss.spv");
     VkShaderModule shadowMissModule = loadShaderModule(device, "shaders/shadow.rmiss.spv");
+    VkShaderModule closestHitModule = loadShaderModule(device, "shaders/closesthit.rchit.spv");
 
+    // Ordered raygen, then BOTH miss shaders contiguously, then the hit
+    // group -- this ordering must match the SBT's region layout below
+    // (each region assumes its shaders are contiguous in this array).
     std::array<VkPipelineShaderStageCreateInfo, 4> stages{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
@@ -635,13 +684,13 @@ int main() {
     stages[1].pName = "main";
 
     stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-    stages[2].module = closestHitModule;
+    stages[2].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+    stages[2].module = shadowMissModule;
     stages[2].pName = "main";
 
     stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[3].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-    stages[3].module = shadowMissModule;
+    stages[3].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    stages[3].module = closestHitModule;
     stages[3].pName = "main";
 
     std::array<VkRayTracingShaderGroupCreateInfoKHR, 4> groups{};
@@ -660,16 +709,16 @@ int main() {
     groups[1].intersectionShader = VK_SHADER_UNUSED_KHR;
 
     groups[2].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-    groups[2].generalShader = VK_SHADER_UNUSED_KHR;
-    groups[2].closestHitShader = 2;
+    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[2].generalShader = 2;
+    groups[2].closestHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
 
     groups[3].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[3].generalShader = 3;
-    groups[3].closestHitShader = VK_SHADER_UNUSED_KHR;
+    groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[3].generalShader = VK_SHADER_UNUSED_KHR;
+    groups[3].closestHitShader = 3;
     groups[3].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[3].intersectionShader = VK_SHADER_UNUSED_KHR;
 
@@ -679,8 +728,8 @@ int main() {
     pipelineInfo.pStages = stages.data();
     pipelineInfo.groupCount = (uint32_t)groups.size();
     pipelineInfo.pGroups = groups.data();
-    // Primary ray (depth 1) + the shadow ray closesthit.rchit traces for
-    // occlusion (depth 2).
+    // 2, not 1: the closest-hit shader now itself calls traceRayEXT for
+    // the shadow ray, one level of recursion deeper than before.
     pipelineInfo.maxPipelineRayRecursionDepth = 2;
     pipelineInfo.layout = pipelineLayout;
 
@@ -692,8 +741,6 @@ int main() {
     std::cout << "Ray tracing pipeline created.\n";
 
     // Shader binding table
-    // handleData[] order matches groups[] order: 0=raygen, 1=primary miss,
-    // 2=hit group, 3=shadow miss.
     uint32_t handleSize = rtProps.shaderGroupHandleSize;
     uint32_t handleAlignment = rtProps.shaderGroupHandleAlignment;
     uint32_t baseAlignment = rtProps.shaderGroupBaseAlignment;
@@ -705,9 +752,7 @@ int main() {
                                               handleData.size(), handleData.data());
 
     VkDeviceSize raygenRegionSize = alignUp(handleSizeAligned, baseAlignment);
-    // Two miss shaders now: primary (missIndex 0, raygen.rgen's trace) and
-    // shadow (missIndex 1, closesthit.rchit's trace) -- order here must
-    // match those missIndex values.
+    // 2 miss shaders now (primary + shadow), contiguous in the SBT.
     VkDeviceSize missRegionSize = alignUp(2 * handleSizeAligned, baseAlignment);
     VkDeviceSize hitRegionSize = alignUp(1 * handleSizeAligned, baseAlignment);
     VkDeviceSize sbtSize = raygenRegionSize + missRegionSize + hitRegionSize;
@@ -721,13 +766,13 @@ int main() {
 
     uint8_t* sbtMapped;
     vkMapMemory(device, sbtMemory, 0, sbtSize, 0, (void**)&sbtMapped);
-    memcpy(sbtMapped, handleData.data() + 0 * handleSize, handleSize);  // raygen
-    memcpy(sbtMapped + raygenRegionSize + 0 * handleSizeAligned,
-           handleData.data() + 1 * handleSize, handleSize);             // primary miss (missIndex 0)
-    memcpy(sbtMapped + raygenRegionSize + 1 * handleSizeAligned,
-           handleData.data() + 3 * handleSize, handleSize);             // shadow miss (missIndex 1)
-    memcpy(sbtMapped + raygenRegionSize + missRegionSize,
-           handleData.data() + 2 * handleSize, handleSize);             // hit group
+    // Group 0 (raygen) -> raygen region
+    memcpy(sbtMapped, handleData.data() + 0 * handleSize, handleSize);
+    // Groups 1, 2 (primary miss, shadow miss) -> miss region, in order
+    memcpy(sbtMapped + raygenRegionSize, handleData.data() + 1 * handleSize, handleSize);
+    memcpy(sbtMapped + raygenRegionSize + handleSizeAligned, handleData.data() + 2 * handleSize, handleSize);
+    // Group 3 (closesthit) -> hit region
+    memcpy(sbtMapped + raygenRegionSize + missRegionSize, handleData.data() + 3 * handleSize, handleSize);
     vkUnmapMemory(device, sbtMemory);
 
     VkDeviceAddress sbtAddress = getBufferDeviceAddress(device, sbtBuffer);
@@ -813,7 +858,7 @@ int main() {
     std::array<VkWriteDescriptorSet, 2> writes = { write0, write1 };
     vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 
-    // Camera and light setup, matching the CUDA kernel's math
+    // Camera + light setup, matching the CUDA kernel's math
     Vec3 camOrigin{0.0f, 1.0f, 3.0f};
     Vec3 camTarget{0.0f, 1.0f, 0.0f};
     Vec3 worldUp{0.0f, 1.0f, 0.0f};
@@ -835,16 +880,33 @@ int main() {
     pc.camForward[0] = forward.x; pc.camForward[1] = forward.y; pc.camForward[2] = forward.z; pc.camForward[3] = 0.0f;
     pc.lightPosIntensity[0] = lightPos.x; pc.lightPosIntensity[1] = lightPos.y; pc.lightPosIntensity[2] = lightPos.z;
     pc.lightPosIntensity[3] = lightIntensity;
-    pc.params[0] = tanHalfFov; pc.params[1] = aspect; pc.params[2] = 0.0f; pc.params[3] = 0.0f;
+    // Mitsuba's 'tx' emitter is a spot light with cutoff_angle=40 and an
+    // implicit beam_width of cutoff_angle*3/4=30 (get_deafult_scene()
+    // doesn't set beam_width explicitly, so Mitsuba's own default applies).
+    // Packed here in radians since there's no room left in this struct for
+    // a separate light-forward vector; the shader derives the spot's axis
+    // from lightPos assuming a world-origin target, matching this scene.
+    const float cutoffAngleDeg = 40.0f;
+    const float beamWidthDeg = 30.0f;
+    pc.params[0] = tanHalfFov; pc.params[1] = aspect;
+    pc.params[2] = cutoffAngleDeg * 3.14159265358979f / 180.0f;
+    pc.params[3] = beamWidthDeg * 3.14159265358979f / 180.0f;
     pc.vertexBufferAddress = getBufferDeviceAddress(device, vertexBuffer);
     pc.indexBufferAddress = getBufferDeviceAddress(device, indexBuffer);
+    pc.normalBufferAddress = getBufferDeviceAddress(device, normalBuffer);
 
     // Dispatch the trace, timed over multiple iterations for a stable average
+    // (matches the methodology used earlier for the Mitsuba-vs-CUDA benchmark:
+    // measure real per-frame cost, not a single noisy sample)
     const int TRACE_ITERATIONS = 100;
     double totalTraceMs = 0.0;
 
     for (int i = 0; i < TRACE_ITERATIONS; i++) {
         auto traceStart = std::chrono::high_resolution_clock::now();
+
+        // Capture only the first dispatch -- no need to capture all 100
+        // timing iterations, and doing so would just bloat the capture file.
+        if (i == 0 && rdoc_api) rdoc_api->StartFrameCapture(nullptr, nullptr);
 
         VkCommandBuffer traceCmd = beginOneTimeCommands(device, cmdPool);
         vkCmdBindPipeline(traceCmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
@@ -856,6 +918,11 @@ int main() {
         pfn_vkCmdTraceRaysKHR(traceCmd, &raygenRegion, &missRegion, &hitRegion, &callableRegion,
                               WIDTH, HEIGHT, 1);
         endAndSubmitOneTimeCommands(device, queue, cmdPool, traceCmd);
+
+        if (i == 0 && rdoc_api) {
+            rdoc_api->EndFrameCapture(nullptr, nullptr);
+            std::cout << "RenderDoc capture taken for the first trace dispatch.\n";
+        }
 
         auto traceEnd = std::chrono::high_resolution_clock::now();
         totalTraceMs += std::chrono::duration<double, std::milli>(traceEnd - traceStart).count();
@@ -932,7 +999,6 @@ int main() {
     vkDestroyShaderModule(device, raygenModule, nullptr);
     vkDestroyShaderModule(device, closestHitModule, nullptr);
     vkDestroyShaderModule(device, missModule, nullptr);
-    vkDestroyShaderModule(device, shadowMissModule, nullptr);
 
     pfn_vkDestroyAccelerationStructureKHR(device, tlas.handle, nullptr);
     vkDestroyBuffer(device, tlas.buffer, nullptr);
@@ -944,6 +1010,8 @@ int main() {
 
     vkDestroyBuffer(device, vertexBuffer, nullptr);
     vkFreeMemory(device, vertexMemory, nullptr);
+    vkDestroyBuffer(device, normalBuffer, nullptr);
+    vkFreeMemory(device, normalMemory, nullptr);
     vkDestroyBuffer(device, indexBuffer, nullptr);
     vkFreeMemory(device, indexMemory, nullptr);
 

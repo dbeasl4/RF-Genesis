@@ -1,12 +1,12 @@
 // raytracer_live.cpp: a persistent, Python-callable Vulkan ray tracer.
 // Combines real hardware ray tracing (mesh, camera, Lambertian shading,
 // validated against Mitsuba) with zero-copy Vulkan-CUDA memory sharing for
-// the output buffer. 
+// the output buffer. Full scope notes (what's zero-copy, what isn't, and
+// why) are in the README.
 //
 // Exposes a `RayTracer` class to Python via pybind11, with a persistent
 // Vulkan context (instance, device, pipeline, and buffers created once in
 // the constructor and reused across many trace() calls).
-
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -20,7 +20,7 @@
 #include <string>
 #include <array>
 
-// function pointers (loaded once, in the constructor)
+// ---------- function pointers (loaded once, in the constructor) ----------
 
 static PFN_vkGetAccelerationStructureBuildSizesKHR pfn_vkGetAccelerationStructureBuildSizesKHR = nullptr;
 static PFN_vkCreateAccelerationStructureKHR pfn_vkCreateAccelerationStructureKHR = nullptr;
@@ -60,7 +60,7 @@ static void loadFunctions(VkDevice device) {
     }
 }
 
-// small helpers (same as main.cpp / interop_test.cpp)
+// ---------- small helpers (same as main.cpp / interop_test.cpp) ----------
 
 static uint32_t findMemoryType(VkPhysicalDevice pd, uint32_t typeFilter, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -146,7 +146,7 @@ static void endAndSubmit(VkDevice device, VkQueue queue, VkCommandPool pool, VkC
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
     vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue); 
+    vkQueueWaitIdle(queue); // correctness-first; see file header note on synchronization scope
     vkFreeCommandBuffers(device, pool, 1, &cmd);
 }
 
@@ -198,7 +198,9 @@ static Vec3 normalize3(const Vec3& a) {
     return len > 1e-12f ? a * (1.0f / len) : a;
 }
 
+// ============================================================
 //  The persistent RayTracer class
+// ============================================================
 
 class RayTracer {
 public:
@@ -206,11 +208,16 @@ public:
         : resolution_(resolution), fov_(fov), shaderDir_(shaderDir) {
 
         uint32_t triangleCount = (uint32_t)faces.size(0);
-        // .needed because would cause seg fault if not
-        // ran into this error
+        // .cpu() is essential here, not optional -- if anything upstream
+        // (e.g. pathtracer.py's module-level torch.set_default_device('cuda'))
+        // has changed PyTorch's default device, a plain torch.zeros(...)
+        // with no explicit device can silently be a CUDA tensor. Using its
+        // data_ptr() directly in a host-side memcpy without .cpu() first
+        // reads a GPU pointer as if it were host memory -- undefined
+        // behavior, confirmed via debugging to be exactly this segfault.
         auto facesAcc = faces.contiguous().to(torch::kInt32).cpu();
 
-        // instance and device
+        // ---------- instance + device (matched to CUDA by UUID, same as part 1) ----------
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.apiVersion = VK_API_VERSION_1_3;
@@ -297,9 +304,9 @@ public:
         pi.queueFamilyIndex = queueFamily;
         vkCreateCommandPool(device_, &pi, nullptr, &cmdPool_);
 
-
+        // ---------- fixed-topology buffers (vertex buffer reused every frame) ----------
         triangleCount_ = triangleCount;
-        vertexCount_ = 0; // set on first update_pose()
+        vertexCount_ = 0; // set on first update_pose() call
 
         VkDeviceSize indexBufferSize = (VkDeviceSize)triangleCount * 3 * sizeof(uint32_t);
         createBuffer(physicalDevice_, device_, indexBufferSize,
@@ -320,7 +327,7 @@ public:
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      vertexBuffer_, vertexMemory_);
 
-        // pipeline and shaders
+        // ---------- pipeline + shaders (built once) ----------
         VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
         rtProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
         VkPhysicalDeviceProperties2 props2{};
@@ -332,7 +339,7 @@ public:
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
         bindings[1].binding = 1;
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[1].descriptorCount = 1;
@@ -356,13 +363,13 @@ public:
         pli.pPushConstantRanges = &pcRange;
         vkCreatePipelineLayout(device_, &pli, nullptr, &pipelineLayout_);
 
-        
+        // Shader paths relative to wherever Python is run from -- see the
+        // Python wrapper for how this is resolved to an absolute path.
         VkShaderModule raygenMod = loadShaderModule(device_, shaderDir_ + "/raygen.rgen.spv");
         VkShaderModule chitMod = loadShaderModule(device_, shaderDir_ + "/closesthit.rchit.spv");
         VkShaderModule missMod = loadShaderModule(device_, shaderDir_ + "/miss.rmiss.spv");
-        VkShaderModule shadowMissMod = loadShaderModule(device_, shaderDir_ + "/shadow.rmiss.spv");
 
-        std::array<VkPipelineShaderStageCreateInfo, 4> stages{};
+        std::array<VkPipelineShaderStageCreateInfo, 3> stages{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
         stages[0].module = raygenMod; stages[0].pName = "main";
@@ -372,11 +379,8 @@ public:
         stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
         stages[2].module = chitMod; stages[2].pName = "main";
-        stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[3].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-        stages[3].module = shadowMissMod; stages[3].pName = "main";
 
-        std::array<VkRayTracingShaderGroupCreateInfoKHR, 4> groups{};
+        std::array<VkRayTracingShaderGroupCreateInfoKHR, 3> groups{};
         groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
         groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
         groups[0].generalShader = 0; groups[0].closestHitShader = VK_SHADER_UNUSED_KHR;
@@ -389,18 +393,12 @@ public:
         groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
         groups[2].generalShader = VK_SHADER_UNUSED_KHR; groups[2].closestHitShader = 2;
         groups[2].anyHitShader = VK_SHADER_UNUSED_KHR; groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
-        groups[3].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-        groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-        groups[3].generalShader = 3; groups[3].closestHitShader = VK_SHADER_UNUSED_KHR;
-        groups[3].anyHitShader = VK_SHADER_UNUSED_KHR; groups[3].intersectionShader = VK_SHADER_UNUSED_KHR;
 
         VkRayTracingPipelineCreateInfoKHR rpci{};
         rpci.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-        rpci.stageCount = 4; rpci.pStages = stages.data();
-        rpci.groupCount = 4; rpci.pGroups = groups.data();
-        // Primary ray (depth 1) + the shadow ray closesthit.rchit traces
-        // for occlusion (depth 2).
-        rpci.maxPipelineRayRecursionDepth = 2;
+        rpci.stageCount = 3; rpci.pStages = stages.data();
+        rpci.groupCount = 3; rpci.pGroups = groups.data();
+        rpci.maxPipelineRayRecursionDepth = 1;
         rpci.layout = pipelineLayout_;
         if (pfn_vkCreateRayTracingPipelinesKHR(device_, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &rpci, nullptr, &pipeline_) != VK_SUCCESS)
             throw std::runtime_error("Failed to create ray tracing pipeline.");
@@ -408,24 +406,18 @@ public:
         vkDestroyShaderModule(device_, raygenMod, nullptr);
         vkDestroyShaderModule(device_, chitMod, nullptr);
         vkDestroyShaderModule(device_, missMod, nullptr);
-        vkDestroyShaderModule(device_, shadowMissMod, nullptr);
 
-        // shader binding table
-        // handles[] order matches groups[] order: 0=raygen, 1=primary miss,
-        // 2=hit group, 3=shadow miss.
+        // ---------- shader binding table ----------
         uint32_t handleSize = rtProps.shaderGroupHandleSize;
         uint32_t handleAligned = (uint32_t)alignUp(handleSize, rtProps.shaderGroupHandleAlignment);
         uint32_t baseAlign = rtProps.shaderGroupBaseAlignment;
-        std::vector<uint8_t> handles(4 * handleSize);
-        pfn_vkGetRayTracingShaderGroupHandlesKHR(device_, pipeline_, 0, 4, handles.size(), handles.data());
+        std::vector<uint8_t> handles(3 * handleSize);
+        pfn_vkGetRayTracingShaderGroupHandlesKHR(device_, pipeline_, 0, 3, handles.size(), handles.data());
 
         raygenRegion_.stride = alignUp(handleAligned, baseAlign);
         raygenRegion_.size = raygenRegion_.stride;
         missRegion_.stride = handleAligned;
-        // Two miss shaders now: primary (missIndex 0, raygen.rgen's trace)
-        // and shadow (missIndex 1, closesthit.rchit's trace) -- their
-        // order here must match those missIndex values exactly.
-        missRegion_.size = alignUp(2 * handleAligned, baseAlign);
+        missRegion_.size = alignUp(handleAligned, baseAlign);
         hitRegion_.stride = handleAligned;
         hitRegion_.size = alignUp(handleAligned, baseAlign);
         VkDeviceSize sbtSize = raygenRegion_.size + missRegion_.size + hitRegion_.size;
@@ -435,13 +427,9 @@ public:
                      sbtBuffer_, sbtMemory_);
         uint8_t* sbtMap;
         vkMapMemory(device_, sbtMemory_, 0, sbtSize, 0, (void**)&sbtMap);
-        memcpy(sbtMap, handles.data() + 0 * handleSize, handleSize);  // raygen
-        memcpy(sbtMap + raygenRegion_.size + 0 * missRegion_.stride,
-               handles.data() + 1 * handleSize, handleSize);          // primary miss (missIndex 0)
-        memcpy(sbtMap + raygenRegion_.size + 1 * missRegion_.stride,
-               handles.data() + 3 * handleSize, handleSize);          // shadow miss (missIndex 1)
-        memcpy(sbtMap + raygenRegion_.size + missRegion_.size,
-               handles.data() + 2 * handleSize, handleSize);          // hit group
+        memcpy(sbtMap, handles.data(), handleSize);
+        memcpy(sbtMap + raygenRegion_.size, handles.data() + handleSize, handleSize);
+        memcpy(sbtMap + raygenRegion_.size + missRegion_.size, handles.data() + 2 * handleSize, handleSize);
         vkUnmapMemory(device_, sbtMemory_);
 
         VkDeviceAddress sbtAddr = getBufferDeviceAddress(device_, sbtBuffer_);
@@ -450,7 +438,7 @@ public:
         hitRegion_.deviceAddress = sbtAddr + raygenRegion_.size + missRegion_.size;
         callableRegion_ = {};
 
-        // EXPORTABLE output buffer (distance, intensity per pixel)
+        // ---------- EXPORTABLE output buffer (distance, intensity per pixel) ----------
         outputBufferSize_ = (VkDeviceSize)resolution_ * resolution_ * 2 * sizeof(float);
         createBuffer(physicalDevice_, device_, outputBufferSize_,
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -490,7 +478,7 @@ public:
         if (cudaExternalMemoryGetMappedBuffer(&outputDevPtr_, cudaExtMem_, &bufDesc) != cudaSuccess)
             throw std::runtime_error("cudaExternalMemoryGetMappedBuffer failed.");
 
-        // descriptor set (created once; TLAS handle gets updated per-frame)
+        // ---------- descriptor set (created once; TLAS handle gets updated per-frame) ----------
         VkDescriptorPoolSize poolSizes[2];
         poolSizes[0] = {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1};
         poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
@@ -553,7 +541,8 @@ public:
         camTarget_ = {target[0], target[1], target[2]};
     }
 
-    // vertices: CPU float32 tensor, shape [V, 3] Rebuilds the BLAS/TLAS every call, since the mesh deforms.
+    // vertices: CPU float32 tensor, shape [V, 3] -- NOT zero-copy (see file
+    // header). Rebuilds the BLAS/TLAS every call, since the mesh deforms.
     void update_pose(torch::Tensor vertices) {
         auto v = vertices.contiguous().to(torch::kFloat32).cpu();
         vertexCount_ = (uint32_t)v.size(0);
@@ -602,7 +591,8 @@ public:
         endAndSubmit(device_, queue_, cmdPool_, cmd);
 
         // Output is already in CUDA-visible memory (outputDevPtr_, imported
-        // once at construction)
+        // once at construction) -- no copy needed here at all, this is the
+        // true zero-copy part.
         auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, cudaDevice_);
         torch::Tensor raw = torch::from_blob(outputDevPtr_, {resolution_, resolution_, 2}, options).clone();
         // .clone() so the returned tensor is independent of this object's
@@ -620,7 +610,7 @@ public:
         torch::Tensor velocity = torch::zeros_like(distance);
         torch::Tensor PIR = torch::stack({distance, intensity, velocity}, 2);
 
-        // Reconstruct world-space hit position per pixel from distance and
+        // Reconstruct world-space hit position per pixel from distance +
         // ray direction (same math as the CUDA wrapper), computed on GPU.
         auto arangeOpts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, cudaDevice_);
         torch::Tensor xs = (torch::arange(resolution_, arangeOpts) + 0.5) / resolution_ * 2.0 - 1.0;
@@ -651,12 +641,11 @@ private:
     };
 
     void rebuildAccelerationStructures() {
-        // Destroy last frame's BLAS/TLAS before building this frame's, since
-        // the mesh deforms every call and we don't reuse acceleration structures.
+        // Destroy previous frame's AS (if any) before rebuilding
         if (blas_.handle) { pfn_vkDestroyAccelerationStructureKHR(device_, blas_.handle, nullptr); vkDestroyBuffer(device_, blas_.buffer, nullptr); vkFreeMemory(device_, blas_.memory, nullptr); blas_ = {}; }
         if (tlas_.handle) { pfn_vkDestroyAccelerationStructureKHR(device_, tlas_.handle, nullptr); vkDestroyBuffer(device_, tlas_.buffer, nullptr); vkFreeMemory(device_, tlas_.memory, nullptr); tlas_ = {}; }
 
-        // BLAS
+        // --- BLAS ---
         VkAccelerationStructureGeometryTrianglesDataKHR tri{};
         tri.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
         tri.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
@@ -711,7 +700,7 @@ private:
         addrInfo.accelerationStructure = blas_.handle;
         blas_.deviceAddress = pfn_vkGetAccelerationStructureDeviceAddressKHR(device_, &addrInfo);
 
-        // TLAS
+        // --- TLAS ---
         VkAccelerationStructureInstanceKHR inst{};
         inst.transform.matrix[0][0] = 1.0f; inst.transform.matrix[1][1] = 1.0f; inst.transform.matrix[2][2] = 1.0f;
         inst.mask = 0xFF;

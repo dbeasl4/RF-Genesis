@@ -3,13 +3,13 @@ Renders the same SMPL body pose (as exported by export_mesh.py) through
 Mitsuba, using the same camera position/target/fov as the Vulkan program,
 so the two outputs can be compared directly. Run from vulkan_raytracer/.
 Pass the same arguments used with export_mesh.py so both programs render
-the identical pose. 
+the identical pose. See GETTING_STARTED.md for details.
 
 Known expected difference: Mitsuba's light ('tx' in pathtracer.py's
 get_deafult_scene()) is a spot light with a 40-degree cutoff angle. The
 Vulkan shader currently models a simple omnidirectional point light with
 no directional falloff, so shading near the edges of Mitsuba's spot cone
-may differ somewhat. This is a known model difference between the two.
+may differ somewhat. This is a known model difference, not a bug.
 """
 import sys
 import os
@@ -25,6 +25,7 @@ if _repo_root not in sys.path:
 parser = argparse.ArgumentParser()
 parser.add_argument("--motion", default=None, help="Path to obj_diff.npz to pull a real pose from")
 parser.add_argument("--frame", type=int, default=0)
+parser.add_argument("--resolution", type=int, default=128, help="Render resolution, must match the Vulkan program's WIDTH/HEIGHT for a fair comparison")
 args = parser.parse_args()
 motion_path = os.path.abspath(args.motion) if args.motion else None
 
@@ -39,9 +40,18 @@ intensity_out = os.path.abspath("mitsuba_intensity.png")
 # Mitsuba's scene definition needs cwd = RF-Genesis/genesis/
 os.chdir(os.path.join(_repo_root, "genesis"))
 
-from genesis.raytracing.pathtracer import RayTracer
+from genesis.raytracing.pathtracer import RayTracer, get_deafult_scene
+import mitsuba as mi
 
 tracer = RayTracer()  # PIR_resolution=128 by default, matching the Vulkan program's WIDTH/HEIGHT
+
+if args.resolution != tracer.PIR_resolution:
+    # RayTracer's __init__ hardcodes resolution to 128 and builds the
+    # scene from it immediately -- rebuild the same way, at the
+    # requested resolution instead, rather than editing pathtracer.py.
+    tracer.PIR_resolution = args.resolution
+    tracer.scene = mi.load_dict(get_deafult_scene(res=tracer.PIR_resolution))
+    tracer.params_scene = mi.traverse(tracer.scene)
 
 if motion_path:
     data = np.load(motion_path, allow_pickle=True)

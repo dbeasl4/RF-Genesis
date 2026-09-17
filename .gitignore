@@ -184,3 +184,9 @@ genesis/raytracing/RayTracerCustom/*.egg-info/
 # Generated output
 output/
 genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/*.png
+genesis/raytracing/vulkan_raytracer/src/renderdoc_app.h
+
+# Generated mesh/output data from manual testing
+genesis/raytracing/vulkan_raytracer/smpl_mesh.bin
+genesis/raytracing/vulkan_raytracer/*.png
+genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/*.npz

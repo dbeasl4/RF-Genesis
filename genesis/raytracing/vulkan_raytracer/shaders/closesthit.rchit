@@ -5,14 +5,16 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // Lambertian shading matching the CUDA kernel's math (N.L, inverse-square
-// falloff, spot cone, shadow ray). Fetches the hit triangle's vertices via
-// buffer_reference to compute a normal, since the hardware only gives us
-// gl_PrimitiveID.
-
-layout(buffer_reference, scalar) buffer Vertices { vec3 v[]; };
-layout(buffer_reference, scalar) buffer Indices { uint i[]; };
+// falloff). Fetches the hit triangle's per-vertex normals via
+// buffer_reference and interpolates them using barycentric coordinates,
+// for smooth (not faceted) shading across curved surfaces. Shadow ray via
+// a real recursive traceRayEXT call (not a ray query -- see README for
+// why). See README for more.
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+layout(buffer_reference, scalar) buffer Normals { vec3 n[]; };
+layout(buffer_reference, scalar) buffer Indices { uint i[]; };
 
 layout(push_constant) uniform PushConstants {
     vec4 camOrigin;
@@ -23,33 +25,41 @@ layout(push_constant) uniform PushConstants {
     vec4 params;
     uint64_t vertexBufferAddress;
     uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
 } pc;
 
 struct RayPayload { float distance; float intensity; };
 layout(location = 0) rayPayloadInEXT RayPayload payload;
-layout(location = 1) rayPayloadEXT bool shadowed;
+
+// Payload for the shadow ray THIS shader traces (location 1, distinct
+// from the location-0 payload we ourselves were invoked with above).
+layout(location = 1) rayPayloadEXT float shadowPayload;
+
+// Barycentric coordinates of the hit within the triangle, filled in by
+// the hardware triangle intersector (not something we compute ourselves).
+hitAttributeEXT vec2 attribs;
 
 void main() {
-    Vertices vertices = Vertices(pc.vertexBufferAddress);
+    Normals normalsBuf = Normals(pc.normalBufferAddress);
     Indices indices = Indices(pc.indexBufferAddress);
 
     uint i0 = indices.i[gl_PrimitiveID * 3 + 0];
     uint i1 = indices.i[gl_PrimitiveID * 3 + 1];
     uint i2 = indices.i[gl_PrimitiveID * 3 + 2];
 
-    vec3 v0 = vertices.v[i0];
-    vec3 v1 = vertices.v[i1];
-    vec3 v2 = vertices.v[i2];
+    vec3 n0 = normalsBuf.n[i0];
+    vec3 n1 = normalsBuf.n[i1];
+    vec3 n2 = normalsBuf.n[i2];
 
-    vec3 edge1 = v1 - v0;
-    vec3 edge2 = v2 - v0;
-    vec3 normal = normalize(cross(edge1, edge2));
+    // attribs = (u, v); the weight on vertex 0 is what's left over.
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec3 normal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
 
     vec3 worldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 
-    // Flip the normal to face the camera same as the CUDA kernel does,
-    // since Moller-Trumbore-style normals 
-    // don't have a guaranteed consistent winding relative to the viewer.
+    // Flip the normal to face the camera, same as the CUDA kernel does.
+    // With proper vertex normals this should rarely trigger, but kept as
+    // a safety net in case any normals ended up facing inward.
     vec3 toCam = normalize(-gl_WorldRayDirectionEXT);
     if (dot(normal, toCam) < 0.0) {
         normal = -normal;
@@ -63,11 +73,29 @@ void main() {
     vec3 lightDir = toLight / max(distToLight, 1e-6);
 
     float ndotl = max(dot(normal, lightDir), 0.0);
-    float falloff = lightIntensity / max(distToLight * distToLight, 1e-4);
 
-    // Match Mitsuba's diffuse BSDF: albedo/pi * N.L * irradiance.
-    const float albedo = 0.8;
-    const float PI = 3.14159265359;
+    // Shadow ray: trace from this point toward the light. Assume occluded
+    // (1.0) before tracing; shadow.rmiss clears it to 0.0 if the ray hits
+    // nothing. gl_RayFlagsSkipClosestHitShaderEXT means an actual hit
+    // just leaves the payload at 1.0 rather than needing its own
+    // closest-hit shader -- we only need to know hit-or-miss, not what
+    // was hit. Offset the origin along the normal to avoid immediately
+    // self-intersecting the same triangle.
+    bool occluded = false;
+    if (ndotl > 0.0) {
+        float epsilon = 0.01;
+        vec3 shadowOrigin = worldPos + normal * epsilon;
+        shadowPayload = 1.0;
+        traceRayEXT(topLevelAS,
+                    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                    0xFF, 0, 0, 1,
+                    shadowOrigin, epsilon, lightDir, distToLight - epsilon * 2.0,
+                    1);
+        occluded = (shadowPayload > 0.5);
+    }
+
+    float shadowedNdotL = occluded ? 0.0 : ndotl;
+    float falloff = lightIntensity / max(distToLight * distToLight, 1e-4);
 
     // Mitsuba's 'tx' emitter (pathtracer.py's get_deafult_scene()) is a
     // spot light, not an isotropic point light: linear angular falloff
@@ -92,34 +120,12 @@ void main() {
         spotFalloff = (cutoffRad - theta) / max(cutoffRad - beamRad, 1e-6);
     }
 
-    // Shadow ray: Mitsuba's 'direct' integrator traces a real
-    // visibility/shadow ray as part of sampling direct illumination, so
-    // points occluded by other parts of the body come out dark. Without
-    // this, every front-facing point got full unoccluded light regardless
-    // of what's between it and the light -- verified against Mitsuba: mean
-    // intensity over hit pixels came out 60-130% too high with this
-    // omitted, while max (rarely self-shadowed) stayed close.
-    //
-    // gl_RayFlagsSkipClosestHitShaderEXT + gl_RayFlagsTerminateOnFirstHitEXT
-    // means this is a cheap boolean occlusion query, not a second full
-    // shaded hit: if it hits anything, no shader runs and `shadowed`
-    // keeps the `true` we set below; shadow.rmiss only runs (setting it
-    // false) if the ray reaches the light unobstructed.
-    vec3 shadowOrigin = worldPos + normal * 1e-3;
-    shadowed = true;
-    traceRayEXT(
-        topLevelAS,
-        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsOpaqueEXT,
-        0xFF,
-        0, 0, 1,  // missIndex 1 -> shadow.rmiss (index within the SBT's miss region)
-        shadowOrigin,
-        0.0,
-        lightDir,
-        max(distToLight - 1e-3, 0.0),
-        1
-    );
-    float shadow = shadowed ? 0.0 : 1.0;
+    // Match Mitsuba's diffuse BSDF: albedo/pi * N.L * irradiance.
+    // See README for why this matters.
+    const float albedo = 0.8;
+    const float PI = 3.14159265359;
 
     payload.distance = gl_HitTEXT;
-    payload.intensity = (albedo / PI) * ndotl * falloff * spotFalloff * shadow;
+    payload.intensity = (albedo / PI) * shadowedNdotL * falloff * spotFalloff;
 }
+

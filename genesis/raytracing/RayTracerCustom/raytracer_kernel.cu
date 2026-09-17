@@ -7,7 +7,7 @@
 //
 // Intentionally simple: for ~13.7k triangles at 128x128, brute force (no
 // BVH) is fast enough on a modern GPU and easier to start with than an
-// acceleration structure.
+// acceleration structure. See NEXT STEPS below and the README.
 
 #include <torch/extension.h>
 #include <cuda.h>
@@ -16,7 +16,7 @@
 
 #define EPSILON 1e-8f
 
-// small float3 helpers 
+// small float3 helpers (CUDA's own float3 has no operators)
 
 __host__ __device__ __forceinline__ float3 f3(float x, float y, float z) { return make_float3(x, y, z); }
 __host__ __device__ __forceinline__ float3 sub3(float3 a, float3 b) { return f3(a.x - b.x, a.y - b.y, a.z - b.z); }
@@ -30,7 +30,8 @@ __host__ __device__ __forceinline__ float3 normalize3(float3 a) {
     float len = sqrtf(dot3(a, a));
     return len > 1e-12f ? scale3(a, 1.0f / len) : a;
 }
-// Moller-Trumbore ray-triangle intersection
+
+// Möller–Trumbore ray-triangle intersection
 
 __device__ __forceinline__ bool ray_triangle_intersect(
     float3 orig, float3 dir,
@@ -60,11 +61,11 @@ __device__ __forceinline__ bool ray_triangle_intersect(
     return true;
 }
 
-// main kernel
+// main kernel: one thread per pixel
 
 __global__ void raytrace_kernel(
-    const float* __restrict__ vertices, 
-    const int*   __restrict__ faces,
+    const float* __restrict__ vertices,   // [num_verts, 3], world space
+    const int*   __restrict__ faces,      // [num_faces, 3], indices into vertices
     int num_faces,
     float3 cam_origin,
     float3 cam_right, float3 cam_up, float3 cam_forward,  // orthonormal camera basis
@@ -75,8 +76,8 @@ __global__ void raytrace_kernel(
     float3 light_forward,  // normalized spot axis, light_pos -> light_target
     float cutoff_rad,      // Mitsuba 'cutoff_angle': falloff reaches 0 here
     float beam_rad,        // Mitsuba 'beam_width': full intensity within this angle
-    float* __restrict__ out_distance,
-    float* __restrict__ out_intensity)
+    float* __restrict__ out_distance,     // [height, width]
+    float* __restrict__ out_intensity)    // [height, width]
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -121,7 +122,8 @@ __global__ void raytrace_kernel(
         float dist_to_light = sqrtf(dot3(to_light, to_light));
         float3 light_dir = scale3(to_light, 1.0f / fmaxf(dist_to_light, 1e-6f));
 
-        // Flip normal to face the camera using Moller
+        // Flip normal to face the camera (Möller–Trumbore gives an
+        // arbitrarily-oriented normal depending on winding order)
         float3 to_cam = normalize3(sub3(cam_origin, hit_pos));
         if (dot3(closest_normal, to_cam) < 0.0f) {
             closest_normal = scale3(closest_normal, -1.0f);
@@ -129,40 +131,6 @@ __global__ void raytrace_kernel(
 
         float ndotl = fmaxf(dot3(closest_normal, light_dir), 0.0f);
         float falloff = light_intensity / fmaxf(dist_to_light * dist_to_light, 1e-4f);
-
-        // Shadow ray: Mitsuba's 'direct' integrator traces a real
-        // visibility/shadow ray as part of sampling direct illumination,
-        // so points on the body occluded by other parts of the body (the
-        // underside of an arm, the back of a leg, etc.) come out dark.
-        // Without this, every front-facing point gets full unoccluded
-        // light regardless of what's between it and the light -- verified
-        // against Mitsuba: mean intensity over hit pixels came out
-        // 60-130% too high with this omitted, while max (rarely
-        // self-shadowed) stayed close.
-        //
-        // Brute-force like the primary ray: fine for ~14k triangles;
-        // revisit with a BVH/any-hit-only query if this doubles cost too
-        // much at higher resolution.
-        float3 shadow_origin = add3(hit_pos, scale3(closest_normal, 1e-3f));
-        bool occluded = false;
-        for (int f2 = 0; f2 < num_faces; f2++) {
-            int j0 = faces[f2 * 3 + 0];
-            int j1 = faces[f2 * 3 + 1];
-            int j2 = faces[f2 * 3 + 2];
-            float3 w0 = f3(vertices[j0 * 3 + 0], vertices[j0 * 3 + 1], vertices[j0 * 3 + 2]);
-            float3 w1 = f3(vertices[j1 * 3 + 0], vertices[j1 * 3 + 1], vertices[j1 * 3 + 2]);
-            float3 w2 = f3(vertices[j2 * 3 + 0], vertices[j2 * 3 + 1], vertices[j2 * 3 + 2]);
-            float t2;
-            float3 n2;
-            // Only care whether *anything* blocks the light, and only
-            // strictly between the surface and the light itself.
-            if (ray_triangle_intersect(shadow_origin, light_dir, w0, w1, w2, t2, n2) &&
-                t2 < dist_to_light - 1e-3f) {
-                occluded = true;
-                break;
-            }
-        }
-        float shadow = occluded ? 0.0f : 1.0f;
 
         // Match Mitsuba's diffuse BSDF (albedo/pi * N.L * irradiance) and
         // the Vulkan closest-hit shader's shading, which both include this
@@ -192,7 +160,7 @@ __global__ void raytrace_kernel(
         }
 
         out_distance[idx] = closest_t;
-        out_intensity[idx] = (albedo / PI) * ndotl * falloff * spot_falloff * shadow;
+        out_intensity[idx] = (albedo / PI) * ndotl * falloff * spot_falloff;
     } else {
         out_distance[idx] = 0.0f;
         out_intensity[idx] = 0.0f;
@@ -202,22 +170,16 @@ __global__ void raytrace_kernel(
 // host-side launcher, exposed to Python
 
 std::vector<torch::Tensor> raytrace_cuda(
-    // Just labeling data here for easier implementation
-
-    // float32 [num_verts, 3], CUDA
-    torch::Tensor vertices,
-    // int32 [num_faces, 3]
-    torch::Tensor faces,
-    // float32 [3]
-    torch::Tensor cam_origin,
-    // float32 [3], normalized
-    torch::Tensor cam_right,
-    torch::Tensor cam_up,
-    torch::Tensor cam_forward,
+    torch::Tensor vertices,    // float32 [num_verts, 3], CUDA
+    torch::Tensor faces,       // int32   [num_faces, 3], CUDA
+    torch::Tensor cam_origin,  // float32 [3]
+    torch::Tensor cam_right,   // float32 [3], normalized
+    torch::Tensor cam_up,      // float32 [3], normalized
+    torch::Tensor cam_forward, // float32 [3], normalized
     double fov_degrees,
     int64_t width,
     int64_t height,
-    torch::Tensor light_pos,
+    torch::Tensor light_pos,   // float32 [3]
     double light_intensity,
     torch::Tensor light_target,   // float32 [3]; spot light aims here
     double cutoff_angle_deg,
@@ -236,7 +198,7 @@ std::vector<torch::Tensor> raytrace_cuda(
     auto out_distance = torch::zeros({height, width}, options);
     auto out_intensity = torch::zeros({height, width}, options);
 
-    
+    // Small fixed-size vectors -> cheap to pull to host for kernel args
     auto co = cam_origin.cpu();
     auto cr = cam_right.cpu();
     auto cu = cam_up.cpu();
@@ -282,3 +244,12 @@ std::vector<torch::Tensor> raytrace_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("raytrace", &raytrace_cuda, "Brute-force CUDA ray tracer (Moller-Trumbore, single bounce)");
 }
+
+// NEXT STEPS (not yet implemented here)
+// 1. Shadow ray: after finding the closest hit, cast a second ray from
+//    hit_pos toward light_pos and re-test against all triangles; if
+//    anything is hit before reaching the light, set intensity = 0.
+//    This is what Mitsuba's `direct` integrator does that this version
+//    currently skips.
+// 2. BVH: only needed if you raise resolution a lot or add much more
+//    geometry. Brute force is fine for the current SMPL-only scene.
