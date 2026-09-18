@@ -10,6 +10,7 @@
 
 #include <vulkan/vulkan.h>
 #include <iostream>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 #include <cstring>
@@ -458,11 +459,18 @@ AccelStruct buildTLAS(VkPhysicalDevice physicalDevice, VkDevice device,
 
 // main
 
-int main() {
+int main(int argc, char** argv) {
     loadRenderDocAPI();
 
-    const uint32_t WIDTH = 128;
-    const uint32_t HEIGHT = 128;
+    uint32_t WIDTH = 128;
+    uint32_t HEIGHT = 128;
+    if (argc >= 2) {
+        WIDTH = HEIGHT = (uint32_t)std::atoi(argv[1]);
+        if (WIDTH == 0) {
+            std::cerr << "Invalid resolution argument, using default 128.\n";
+            WIDTH = HEIGHT = 128;
+        }
+    }
 
     // Instance + device setup
     VkApplicationInfo appInfo{};
@@ -634,7 +642,7 @@ int main() {
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
     bindings[1].binding = 1;
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -665,14 +673,10 @@ int main() {
     vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
 
     VkShaderModule raygenModule = loadShaderModule(device, "shaders/raygen.rgen.spv");
-    VkShaderModule missModule = loadShaderModule(device, "shaders/miss.rmiss.spv");
-    VkShaderModule shadowMissModule = loadShaderModule(device, "shaders/shadow.rmiss.spv");
     VkShaderModule closestHitModule = loadShaderModule(device, "shaders/closesthit.rchit.spv");
+    VkShaderModule missModule = loadShaderModule(device, "shaders/miss.rmiss.spv");
 
-    // Ordered raygen, then BOTH miss shaders contiguously, then the hit
-    // group -- this ordering must match the SBT's region layout below
-    // (each region assumes its shaders are contiguous in this array).
-    std::array<VkPipelineShaderStageCreateInfo, 4> stages{};
+    std::array<VkPipelineShaderStageCreateInfo, 3> stages{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
     stages[0].module = raygenModule;
@@ -684,16 +688,11 @@ int main() {
     stages[1].pName = "main";
 
     stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[2].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-    stages[2].module = shadowMissModule;
+    stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    stages[2].module = closestHitModule;
     stages[2].pName = "main";
 
-    stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[3].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-    stages[3].module = closestHitModule;
-    stages[3].pName = "main";
-
-    std::array<VkRayTracingShaderGroupCreateInfoKHR, 4> groups{};
+    std::array<VkRayTracingShaderGroupCreateInfoKHR, 3> groups{};
     groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
     groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
     groups[0].generalShader = 0;
@@ -709,18 +708,11 @@ int main() {
     groups[1].intersectionShader = VK_SHADER_UNUSED_KHR;
 
     groups[2].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[2].generalShader = 2;
-    groups[2].closestHitShader = VK_SHADER_UNUSED_KHR;
+    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[2].generalShader = VK_SHADER_UNUSED_KHR;
+    groups[2].closestHitShader = 2;
     groups[2].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
-
-    groups[3].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-    groups[3].generalShader = VK_SHADER_UNUSED_KHR;
-    groups[3].closestHitShader = 3;
-    groups[3].anyHitShader = VK_SHADER_UNUSED_KHR;
-    groups[3].intersectionShader = VK_SHADER_UNUSED_KHR;
 
     VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
@@ -728,9 +720,7 @@ int main() {
     pipelineInfo.pStages = stages.data();
     pipelineInfo.groupCount = (uint32_t)groups.size();
     pipelineInfo.pGroups = groups.data();
-    // 2, not 1: the closest-hit shader now itself calls traceRayEXT for
-    // the shadow ray, one level of recursion deeper than before.
-    pipelineInfo.maxPipelineRayRecursionDepth = 2;
+    pipelineInfo.maxPipelineRayRecursionDepth = 1;
     pipelineInfo.layout = pipelineLayout;
 
     VkPipeline pipeline;
@@ -746,14 +736,13 @@ int main() {
     uint32_t baseAlignment = rtProps.shaderGroupBaseAlignment;
     uint32_t handleSizeAligned = (uint32_t)alignUp(handleSize, handleAlignment);
 
-    uint32_t groupCount = 4;
+    uint32_t groupCount = 3;
     std::vector<uint8_t> handleData(groupCount * handleSize);
     pfn_vkGetRayTracingShaderGroupHandlesKHR(device, pipeline, 0, groupCount,
                                               handleData.size(), handleData.data());
 
     VkDeviceSize raygenRegionSize = alignUp(handleSizeAligned, baseAlignment);
-    // 2 miss shaders now (primary + shadow), contiguous in the SBT.
-    VkDeviceSize missRegionSize = alignUp(2 * handleSizeAligned, baseAlignment);
+    VkDeviceSize missRegionSize = alignUp(1 * handleSizeAligned, baseAlignment);
     VkDeviceSize hitRegionSize = alignUp(1 * handleSizeAligned, baseAlignment);
     VkDeviceSize sbtSize = raygenRegionSize + missRegionSize + hitRegionSize;
 
@@ -766,13 +755,9 @@ int main() {
 
     uint8_t* sbtMapped;
     vkMapMemory(device, sbtMemory, 0, sbtSize, 0, (void**)&sbtMapped);
-    // Group 0 (raygen) -> raygen region
     memcpy(sbtMapped, handleData.data() + 0 * handleSize, handleSize);
-    // Groups 1, 2 (primary miss, shadow miss) -> miss region, in order
     memcpy(sbtMapped + raygenRegionSize, handleData.data() + 1 * handleSize, handleSize);
-    memcpy(sbtMapped + raygenRegionSize + handleSizeAligned, handleData.data() + 2 * handleSize, handleSize);
-    // Group 3 (closesthit) -> hit region
-    memcpy(sbtMapped + raygenRegionSize + missRegionSize, handleData.data() + 3 * handleSize, handleSize);
+    memcpy(sbtMapped + raygenRegionSize + missRegionSize, handleData.data() + 2 * handleSize, handleSize);
     vkUnmapMemory(device, sbtMemory);
 
     VkDeviceAddress sbtAddress = getBufferDeviceAddress(device, sbtBuffer);

@@ -182,6 +182,7 @@ struct PushConstants {
     float params[4];
     uint64_t vertexBufferAddress;
     uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
 };
 
 struct Vec3 {
@@ -326,6 +327,16 @@ public:
                      VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      vertexBuffer_, vertexMemory_);
+
+        // Per-vertex smooth normals, same capacity as the vertex buffer.
+        // Not part of the BLAS build (only positions + indices are), just
+        // read directly by the shader via buffer_reference -- STORAGE_BUFFER
+        // usage is enough, same as the standalone main.cpp's normal buffer.
+        VkDeviceSize normalBufferSize = (VkDeviceSize)maxVertexCount_ * 3 * sizeof(float);
+        createBuffer(physicalDevice_, device_, normalBufferSize,
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     normalBuffer_, normalMemory_);
 
         // ---------- pipeline + shaders (built once) ----------
         VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
@@ -529,6 +540,8 @@ public:
         vkDestroyDescriptorSetLayout(device_, descSetLayout_, nullptr);
         vkDestroyBuffer(device_, vertexBuffer_, nullptr);
         vkFreeMemory(device_, vertexMemory_, nullptr);
+        vkDestroyBuffer(device_, normalBuffer_, nullptr);
+        vkFreeMemory(device_, normalMemory_, nullptr);
         vkDestroyBuffer(device_, indexBuffer_, nullptr);
         vkFreeMemory(device_, indexMemory_, nullptr);
         vkDestroyCommandPool(device_, cmdPool_, nullptr);
@@ -541,17 +554,27 @@ public:
         camTarget_ = {target[0], target[1], target[2]};
     }
 
-    // vertices: CPU float32 tensor, shape [V, 3] -- NOT zero-copy (see file
-    // header). Rebuilds the BLAS/TLAS every call, since the mesh deforms.
-    void update_pose(torch::Tensor vertices) {
+    // vertices, normals: CPU float32 tensors, shape [V, 3] each -- NOT
+    // zero-copy (see file header). Rebuilds the BLAS/TLAS every call,
+    // since the mesh deforms. normals are computed fresh each call too,
+    // in Python (live_raytracer.py), from the current frame's deformed
+    // vertices -- they're not fixed topology data like the index buffer.
+    void update_pose(torch::Tensor vertices, torch::Tensor normals) {
         auto v = vertices.contiguous().to(torch::kFloat32).cpu();
+        auto n = normals.contiguous().to(torch::kFloat32).cpu();
         vertexCount_ = (uint32_t)v.size(0);
         if (vertexCount_ > maxVertexCount_) throw std::runtime_error("Vertex count exceeds allocated buffer capacity.");
+        if ((uint32_t)n.size(0) != vertexCount_) throw std::runtime_error("normals must have the same vertex count as vertices.");
 
         void* map;
         vkMapMemory(device_, vertexMemory_, 0, (VkDeviceSize)vertexCount_ * 3 * sizeof(float), 0, &map);
         memcpy(map, v.data_ptr<float>(), (size_t)vertexCount_ * 3 * sizeof(float));
         vkUnmapMemory(device_, vertexMemory_);
+
+        void* nmap;
+        vkMapMemory(device_, normalMemory_, 0, (VkDeviceSize)vertexCount_ * 3 * sizeof(float), 0, &nmap);
+        memcpy(nmap, n.data_ptr<float>(), (size_t)vertexCount_ * 3 * sizeof(float));
+        vkUnmapMemory(device_, normalMemory_);
 
         rebuildAccelerationStructures();
     }
@@ -582,6 +605,7 @@ public:
         pc.params[3] = beamWidthDeg_ * 3.14159265358979f / 180.0f;
         pc.vertexBufferAddress = getBufferDeviceAddress(device_, vertexBuffer_);
         pc.indexBufferAddress = getBufferDeviceAddress(device_, indexBuffer_);
+        pc.normalBufferAddress = getBufferDeviceAddress(device_, normalBuffer_);
 
         VkCommandBuffer cmd = beginOneTime(device_, cmdPool_);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline_);
@@ -786,6 +810,8 @@ private:
 
     VkBuffer vertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory vertexMemory_ = VK_NULL_HANDLE;
+    VkBuffer normalBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory normalMemory_ = VK_NULL_HANDLE;
     VkBuffer indexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory indexMemory_ = VK_NULL_HANDLE;
     uint32_t vertexCount_, maxVertexCount_, triangleCount_;
