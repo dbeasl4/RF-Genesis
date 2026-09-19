@@ -20,12 +20,17 @@
 #include <stdexcept>
 #include <array>
 #include <chrono>
+#ifdef RFGEN_ENABLE_RENDERDOC
 #include <dlfcn.h>
 #include "renderdoc_app.h"
+#endif
 
 // Loaded only if this executable was launched through RenderDoc (its
 // capture library injects itself via LD_PRELOAD beforehand). Stays null,
 // and every call below is a no-op, when run normally outside RenderDoc.
+// Compiled out entirely unless built with -DRFGEN_ENABLE_RENDERDOC=ON,
+// so a normal build never needs renderdoc_app.h present at all.
+#ifdef RFGEN_ENABLE_RENDERDOC
 static RENDERDOC_API_1_6_0* rdoc_api = nullptr;
 
 static void loadRenderDocAPI() {
@@ -44,6 +49,7 @@ static void loadRenderDocAPI() {
         std::cout << "Running without RenderDoc (normal run, or launched outside it).\n";
     }
 }
+#endif
 
 const std::vector<const char*> requiredDeviceExtensions = {
     VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
@@ -460,7 +466,9 @@ AccelStruct buildTLAS(VkPhysicalDevice physicalDevice, VkDevice device,
 // main
 
 int main(int argc, char** argv) {
+#ifdef RFGEN_ENABLE_RENDERDOC
     loadRenderDocAPI();
+#endif
 
     uint32_t WIDTH = 128;
     uint32_t HEIGHT = 128;
@@ -470,6 +478,22 @@ int main(int argc, char** argv) {
             std::cerr << "Invalid resolution argument, using default 128.\n";
             WIDTH = HEIGHT = 128;
         }
+    }
+
+    // Camera origin/target as optional args, so the camera can be
+    // repositioned per-render without needing a rebuild -- e.g. for
+    // scenes whose subjects sit at a different world position than the
+    // default single-body scene this camera was originally tuned for.
+    // Usage: ./vulkan_raytracer [resolution] [ox oy oz] [tx ty tz]
+    // Either group can be omitted; both fall back to the original
+    // Mitsuba-matching defaults if not given.
+    Vec3 camOriginArg{0.0f, 1.0f, 3.0f};
+    Vec3 camTargetArg{0.0f, 1.0f, 0.0f};
+    if (argc >= 5) {
+        camOriginArg = {(float)std::atof(argv[2]), (float)std::atof(argv[3]), (float)std::atof(argv[4])};
+    }
+    if (argc >= 8) {
+        camTargetArg = {(float)std::atof(argv[5]), (float)std::atof(argv[6]), (float)std::atof(argv[7])};
     }
 
     // Instance + device setup
@@ -844,8 +868,8 @@ int main(int argc, char** argv) {
     vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 
     // Camera + light setup, matching the CUDA kernel's math
-    Vec3 camOrigin{0.0f, 1.0f, 3.0f};
-    Vec3 camTarget{0.0f, 1.0f, 0.0f};
+    Vec3 camOrigin = camOriginArg;
+    Vec3 camTarget = camTargetArg;
     Vec3 worldUp{0.0f, 1.0f, 0.0f};
     Vec3 forward = normalize(camTarget - camOrigin);
     Vec3 right = normalize(cross(forward, worldUp));
@@ -891,7 +915,9 @@ int main(int argc, char** argv) {
 
         // Capture only the first dispatch -- no need to capture all 100
         // timing iterations, and doing so would just bloat the capture file.
+#ifdef RFGEN_ENABLE_RENDERDOC
         if (i == 0 && rdoc_api) rdoc_api->StartFrameCapture(nullptr, nullptr);
+#endif
 
         VkCommandBuffer traceCmd = beginOneTimeCommands(device, cmdPool);
         vkCmdBindPipeline(traceCmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
@@ -904,10 +930,12 @@ int main(int argc, char** argv) {
                               WIDTH, HEIGHT, 1);
         endAndSubmitOneTimeCommands(device, queue, cmdPool, traceCmd);
 
+#ifdef RFGEN_ENABLE_RENDERDOC
         if (i == 0 && rdoc_api) {
             rdoc_api->EndFrameCapture(nullptr, nullptr);
             std::cout << "RenderDoc capture taken for the first trace dispatch.\n";
         }
+#endif
 
         auto traceEnd = std::chrono::high_resolution_clock::now();
         totalTraceMs += std::chrono::duration<double, std::milli>(traceEnd - traceStart).count();

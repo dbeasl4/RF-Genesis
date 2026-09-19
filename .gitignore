@@ -199,3 +199,8 @@ obj_diff_long.npz
 obj_diff_real.npz
 obj_diff_long.npz
 intensity_video*.mp4
+
+# Generated npz data and check images from AMASS orientation testing
+*.npz
+check_*.png
+*_check*.png

@@ -17,21 +17,31 @@ Usage:
     python amass_to_rfgen.py path/to/some_amass_file.npz -o obj_diff.npz
     python amass_to_rfgen.py path/to/some_amass_file.npz -o obj_diff.npz --target_fps 30
 
-Known wrinkle worth checking after conversion: AMASS's sub-datasets can
-vary slightly in floor-plane/up-axis convention. Render one frame with
-export_mesh.py/view_output.py or watch the resulting video before
-assuming this is perfectly correct -- if the body appears sideways or
-upside-down, that's a coordinate-convention mismatch to fix, not
-something guaranteed correct by construction.
+Known coordinate-convention wrinkle: AMASS's source datasets (including
+CMU) commonly use a different "up axis" than this pipeline's Y-up scene
+convention, which shows up as the body appearing to walk on a wall
+instead of the floor. This script applies a fixed 90-degree correction
+by default (--fix_orientation, on by default) to both root translation
+and root orientation. If the correction is wrong (body now upside-down,
+or walking backwards/on the ceiling instead), try --fix_axis_sign -1 to
+flip the rotation direction, or --no_fix_orientation to disable it
+entirely and inspect the raw, unrotated data.
 """
 import argparse
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 parser = argparse.ArgumentParser()
 parser.add_argument("amass_file", help="Path to a downloaded AMASS .npz file")
 parser.add_argument("-o", "--output", default="obj_diff_from_amass.npz")
 parser.add_argument("--target_fps", type=float, default=30.0,
                      help="Resample to this frame rate (this pipeline's downstream radar signal generation assumes 30fps)")
+parser.add_argument("--fix_orientation", dest="fix_orientation", action="store_true", default=True,
+                     help="Apply the AMASS-to-this-pipeline coordinate correction (default: on)")
+parser.add_argument("--no_fix_orientation", dest="fix_orientation", action="store_false",
+                     help="Disable the coordinate correction, use AMASS's raw orientation")
+parser.add_argument("--fix_axis_sign", type=float, default=1.0, choices=[1.0, -1.0],
+                     help="Flip the correction rotation's direction if the default guess is wrong (try -1 if the body ends up upside-down or backwards instead of upright)")
 args = parser.parse_args()
 
 amass = np.load(args.amass_file, allow_pickle=True)
@@ -61,6 +71,25 @@ print(f"Source: {n_frames_source} frames at {source_fps:.1f} fps")
 pose_smpl = poses_full[:, :72].astype(np.float32)
 shape_smpl = betas_full[:10].astype(np.float32)
 translation = trans_full.astype(np.float32)
+
+if args.fix_orientation:
+    # AMASS (via its source datasets, including CMU) commonly uses a
+    # different up-axis convention than this pipeline's Y-up scene.
+    # Correct with a 90-degree rotation about X, applied to both the
+    # root translation (a plain 3D point per frame) and the root
+    # orientation (pose[:, :3], the first joint's axis-angle rotation --
+    # composed properly via scipy's Rotation class, not naive vector math,
+    # since axis-angle rotations don't combine by simple addition).
+    correction = Rotation.from_euler('x', 90.0 * args.fix_axis_sign, degrees=True)
+
+    translation = correction.apply(translation).astype(np.float32)
+
+    root_orient = Rotation.from_rotvec(pose_smpl[:, :3])
+    corrected_root = correction * root_orient
+    pose_smpl[:, :3] = corrected_root.as_rotvec().astype(np.float32)
+
+    print(f"Applied {90.0 * args.fix_axis_sign:.0f} degree X-axis coordinate correction "
+          f"(use --fix_axis_sign -1 if this looks wrong, or --no_fix_orientation to disable)")
 
 # Resample to the target frame rate by simple nearest-frame subsampling.
 # A smoother option would interpolate between frames instead, but this
