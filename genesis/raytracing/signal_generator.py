@@ -51,8 +51,20 @@ def create_interpolator(_frames, _pointclouds, environment_pir, frame_rate=30, r
                 raise ValueError("Invalid time value")
             
             frame_index = int(time * frame_rate)
-            if frame_index == num_frames:
-                return frames[-1]
+            if frame_index >= num_frames - 1:
+                last_frame = frames[-1]
+                last_pointcloud = pointclouds[-1]
+                flatten_pir = last_frame.reshape(-1, 3)
+                intensity = flatten_pir[:, 0]
+                depth = flatten_pir[:, 1]
+                mask = (depth > 0.1) & (intensity > 0.1)
+                if environment_pir != None:
+                    combined_intensity = torch.cat((environment_intensity, intensity[mask]), dim=0)
+                    combined_pointcloud = torch.cat((environment_points, last_pointcloud[mask]), dim=0)
+                else:
+                    combined_intensity = intensity[mask]
+                    combined_pointcloud = last_pointcloud[mask]
+                return combined_intensity, combined_pointcloud
             
             t = (time * frame_rate) % 1 # fractional part of time
             frame1 = frames[frame_index]

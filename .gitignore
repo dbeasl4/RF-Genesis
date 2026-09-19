@@ -190,3 +190,12 @@ genesis/raytracing/vulkan_raytracer/src/renderdoc_app.h
 genesis/raytracing/vulkan_raytracer/smpl_mesh.bin
 genesis/raytracing/vulkan_raytracer/*.png
 genesis/raytracing/vulkan_raytracer/VulkanCudaInterop/*.npz
+
+# Generated from AMASS real motion capture data testing (amass_to_rfgen.py)
+obj_diff_real.npz
+obj_diff_long.npz
+
+# Generated from real motion capture data testing (amass_to_rfgen.py, render_intensity_video.py)
+obj_diff_real.npz
+obj_diff_long.npz
+intensity_video*.mp4

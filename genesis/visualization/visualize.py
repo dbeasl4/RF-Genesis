@@ -91,7 +91,11 @@ def draw_skeleton(joints3D, kintree_table, ax=None, with_numbers=False):
 
 def draw_smpl_on_axis(pose,shape,translation=None, ax=None):
     pose = torch.tensor(pose).unsqueeze(0)
-    shape = torch.tensor(shape).unsqueeze(0)
+    # .reshape(-1) first so this works whether shape arrives as a flat
+    # (10,) array or an already-batched (1,10) array (e.g. from
+    # amass_to_rfgen.py, matching the shape[0]-indexing convention used
+    # elsewhere in this pipeline) -- either way, guarantees exactly (1,10).
+    shape = torch.tensor(shape).reshape(-1).unsqueeze(0)
     smpl_layer = SMPL_Layer(center_idx=0,gender='male',model_root='models/smpl_models')
     verts, Jtr = smpl_layer(pose, th_betas=shape)
 
